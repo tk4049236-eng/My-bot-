@@ -4,6 +4,9 @@ import requests
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
+import os
+from flask import Flask
+import threading
 
 # --- ⚙️ CONFIGURATION ---
 BOT_TOKEN = "8462882669:AAHKzV9leqDxXm4tkx38Lw_wU7mINnmVCIc"
@@ -11,11 +14,11 @@ ADMIN_IDS = [7057912029]
 SUPPORT_USER_ID = 7057912029
 CHANNEL_URL = "https://t.me/pfp_kahi_nhi_milega"
 PHONE_API_ENDPOINT = "https://demon.taitanx.workers.dev/?mobile={num}"
-
 USER_DATA_FILE = "users.json"
+
 INITIAL_CREDITS = 3
 REFERRAL_CREDITS = 5
-SEARCH_COST = 1
+SEARCH_COST = 1  # Cost per search
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -23,8 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# --- 💾 Data Management ---
 def load_user_data():
     try:
         with open(USER_DATA_FILE, 'r') as f:
@@ -32,13 +33,10 @@ def load_user_data():
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-
 def save_user_data(data):
     with open(USER_DATA_FILE, 'w') as f:
         json.dump(data, f, indent=4)
 
-
-# --- 🤖 START COMMAND ---
 async def start(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     user_id_str = str(user.id)
@@ -49,12 +47,29 @@ async def start(update: Update, context: CallbackContext) -> None:
     if user_id_str not in user_data:
         user_data[user_id_str] = {"credits": INITIAL_CREDITS, "referred_by": None}
         welcome_message = f"🎉 Welcome, {user.first_name}!\n\nYou have been given **{INITIAL_CREDITS} free credits** to start."
+
+        if context.args and len(context.args) > 0:
+            referrer_id = context.args[0]
+            if referrer_id.isdigit() and referrer_id in user_data and referrer_id != user_id_str:
+                user_data[user_id_str]["referred_by"] = referrer_id
+                user_data[referrer_id]["credits"] += REFERRAL_CREDITS
+                welcome_message += f"\nThanks for joining via a referral!"
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(referrer_id),
+                        text=f"✅ User {user.first_name} joined using your link. You've earned **{REFERRAL_CREDITS} credits**!",
+                        parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not notify referrer {referrer_id}: {e}")
         save_user_data(user_data)
 
-    main_menu_text = f"{welcome_message}\n\nPlease send me a **10-digit mobile number** to start the search or select an option below 👇"
+    main_menu_text = f"{welcome_message}\n\nPlease send me a **10-digit mobile number** to start the search or select an option from the menu."
 
     keyboard = [
-        [InlineKeyboardButton("Phone 📱", callback_data='search_phone')],
+        [
+            InlineKeyboardButton("Phone 📱", callback_data='search_phone')
+        ],
         [
             InlineKeyboardButton("Check Credit 💰", callback_data='check_credit'),
             InlineKeyboardButton("Get Referral Link 🔗", callback_data='get_referral')
@@ -64,16 +79,9 @@ async def start(update: Update, context: CallbackContext) -> None:
             InlineKeyboardButton("Join Channel 📢", url=CHANNEL_URL)
         ]
     ]
-
-    # 👑 Admin-only options
-    if user.id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton("🧮 Manage Credits", callback_data='manage_credits')])
-
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(main_menu_text, reply_markup=reply_markup, parse_mode='Markdown')
 
-
-# --- ⚙️ BUTTON HANDLER ---
 async def button_handler(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
     await query.answer()
@@ -81,189 +89,158 @@ async def button_handler(update: Update, context: CallbackContext) -> None:
     user_id_str = str(user_id)
     user_data = load_user_data()
 
-    # Normal User Options
     if query.data == 'search_phone':
         context.user_data['state'] = 'awaiting_phone'
-        await query.message.reply_text("➡️ Send me a 10-digit mobile number.")
+        await query.message.reply_text("➡️ Please send me the 10-digit mobile number.")
     elif query.data == 'check_credit':
         credits = user_data.get(user_id_str, {}).get('credits', 0)
-        text = f"💰 You have **{credits}** credits." if user_id not in ADMIN_IDS else "👑 You have **unlimited credits**."
-        await query.message.reply_text(text, parse_mode='Markdown')
+        credit_text = f"💰 You have **{credits}** credits."
+        if user_id in ADMIN_IDS:
+            credit_text = "👑 As an admin, you have **unlimited** credits."
+        await context.bot.send_message(chat_id=user_id, text=credit_text, parse_mode='Markdown')
     elif query.data == 'get_referral':
         bot_username = (await context.bot.get_me()).username
         referral_link = f"https://t.me/{bot_username}?start={user_id}"
-        msg = f"🔗 **Your Referral Link**\n\n`{referral_link}`\n\nEach new user gives you **{REFERRAL_CREDITS} credits!**"
-        await query.message.reply_text(msg, parse_mode='Markdown')
+        message_text = (f"🔗 **Your Referral Link**\n\n`{referral_link}`\n\n"
+                        f"Share this link. For every new user who starts the bot, you get **{REFERRAL_CREDITS} credits**! 🚀")
+        await query.message.reply_text(text=message_text, parse_mode='Markdown')
     elif query.data == 'support':
-        support_keyboard = [[InlineKeyboardButton("Contact Admin 👨‍💻", url=f"tg://user?id={SUPPORT_USER_ID}")]]
-        await query.message.reply_text("Need help? Tap below 👇", reply_markup=InlineKeyboardMarkup(support_keyboard))
+        support_text = "Click the button below to contact the admin directly."
+        keyboard = [[InlineKeyboardButton("Contact Admin 👨‍💻", url=f"tg://user?id={SUPPORT_USER_ID}")]]
+        await query.message.reply_text(text=support_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # 👑 Admin Manage Credit Panel
-    elif query.data == 'manage_credits':
-        if user_id in ADMIN_IDS:
-            keyboard = [
-                [InlineKeyboardButton("➕ Add Credits", callback_data='add_credits')],
-                [InlineKeyboardButton("➖ Deduct Credits", callback_data='deduct_credits')],
-                [InlineKeyboardButton("👁️ Check User Credits", callback_data='check_user_credits')]
-            ]
-            await query.message.reply_text("🧮 Choose an admin action:", reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await query.message.reply_text("❌ Only admins can access this panel.")
-
-    elif query.data == 'add_credits':
-        context.user_data['state'] = 'awaiting_target_user_add'
-        await query.message.reply_text("👤 Send the **User ID** to add credits to.")
-
-    elif query.data == 'deduct_credits':
-        context.user_data['state'] = 'awaiting_target_user_deduct'
-        await query.message.reply_text("👤 Send the **User ID** to deduct credits from.")
-
-    elif query.data == 'check_user_credits':
-        context.user_data['state'] = 'awaiting_target_user_check'
-        await query.message.reply_text("👁️ Send the **User ID** whose credits you want to check.")
-
-
-# --- 💬 HANDLE MESSAGES ---
 async def handle_message(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
-    user_id = str(user.id)
+    user_id_str = str(user.id)
     user_data = load_user_data()
 
-    # Admin credit management flow
+    if user_id_str not in user_data:
+        await update.message.reply_text("Please use the /start command first to register.")
+        return
+
+    is_admin = user.id in ADMIN_IDS
+    if not is_admin and user_data[user_id_str].get("credits", 0) < SEARCH_COST:
+        await update.message.reply_text(f"❌ **Out of Credits!**\nEach search costs {SEARCH_COST} credit. Refer friends or contact support to get more.", parse_mode='Markdown')
+        return
+
     state = context.user_data.get('state')
 
-    # --- ADD CREDITS FLOW ---
-    if state == 'awaiting_target_user_add':
-        context.user_data['target_user_id'] = update.message.text.strip()
-        context.user_data['state'] = 'awaiting_credit_amount_add'
-        await update.message.reply_text("💰 Send the **amount of credits** to add.")
-        return
-
-    elif state == 'awaiting_credit_amount_add':
-        try:
-            amount = int(update.message.text.strip())
-            target = context.user_data['target_user_id']
-            if target not in user_data:
-                await update.message.reply_text("❌ User not found.")
-            else:
-                user_data[target]["credits"] += amount
-                save_user_data(user_data)
-                await update.message.reply_text(f"✅ Added **{amount} credits** to `{target}`.", parse_mode='Markdown')
-                try:
-                    await context.bot.send_message(chat_id=int(target),
-                        text=f"🎉 Admin added **{amount} credits** to your account!", parse_mode='Markdown')
-                except:
-                    pass
-        except:
-            await update.message.reply_text("⚠️ Invalid amount.")
-        finally:
-            context.user_data.clear()
-        return
-
-    # --- DEDUCT CREDITS FLOW ---
-    elif state == 'awaiting_target_user_deduct':
-        context.user_data['target_user_id'] = update.message.text.strip()
-        context.user_data['state'] = 'awaiting_credit_amount_deduct'
-        await update.message.reply_text("💳 Send the **amount of credits** to deduct.")
-        return
-
-    elif state == 'awaiting_credit_amount_deduct':
-        try:
-            amount = int(update.message.text.strip())
-            target = context.user_data['target_user_id']
-            if target not in user_data:
-                await update.message.reply_text("❌ User not found.")
-            else:
-                user_data[target]["credits"] = max(0, user_data[target]["credits"] - amount)
-                save_user_data(user_data)
-                await update.message.reply_text(f"✅ Deducted **{amount} credits** from `{target}`.", parse_mode='Markdown')
-                try:
-                    await context.bot.send_message(chat_id=int(target),
-                        text=f"⚠️ Admin deducted **{amount} credits** from your account.", parse_mode='Markdown')
-                except:
-                    pass
-        except:
-            await update.message.reply_text("⚠️ Invalid amount.")
-        finally:
-            context.user_data.clear()
-        return
-
-    # --- CHECK USER CREDITS FLOW ---
-    elif state == 'awaiting_target_user_check':
-        target = update.message.text.strip()
-        if target not in user_data:
-            await update.message.reply_text("❌ User not found.")
-        else:
-            credits = user_data[target]["credits"]
-            await update.message.reply_text(f"👁️ User `{target}` has **{credits} credits**.", parse_mode='Markdown')
-        context.user_data.clear()
-        return
-
-    # --- PHONE LOOKUP ---
     if state == 'awaiting_phone' or (update.message.text.strip().isdigit() and len(update.message.text.strip()) == 10):
         await perform_phone_lookup(update, context)
-        context.user_data.clear()
-        return
+    else:
+        await update.message.reply_text("🤔 Please select **Phone 📱** from the /start menu or send a **10-digit mobile number** directly.")
 
-    # --- DEFAULT ---
-    await update.message.reply_text("🤔 Please select an option from /start or send a 10-digit number.")
+    if 'state' in context.user_data:
+        del context.user_data['state']
 
-
-# --- 🔍 PHONE LOOKUP FUNCTION ---
 async def perform_phone_lookup(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     user_id_str = str(user.id)
     phone_number = update.message.text.strip()
 
     if not (phone_number.isdigit() and len(phone_number) == 10):
-        await update.message.reply_text("❌ Invalid number. Send a valid 10-digit mobile number.")
+        await update.message.reply_text("❌ **Invalid Input**\nPlease send a valid 10-digit mobile number.", parse_mode='Markdown')
         return
 
-    sent = await update.message.reply_text(f"🔎 Searching `{phone_number}`...", parse_mode='Markdown')
+    sent_message = await update.message.reply_text(f"Searching for mobile: `{phone_number}`...", parse_mode='Markdown')
 
     try:
         response = requests.get(PHONE_API_ENDPOINT.format(num=phone_number), timeout=15)
-        data = response.json()
-        results = data.get("data", data.get("results", [data])) if isinstance(data, dict) else data
+        response.raise_for_status()
 
-        if not results:
-            await sent.edit_text(f"🤷 No data found for `{phone_number}`.")
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            logger.error(f"JSON Decode Error for {phone_number}. Response Text: {response.text[:200]}...")
+            await sent_message.edit_text("⚠️ **API Response Error:** Server ne aisa data bheja jise padha nahi jaa sakta. Kripya Admin se sampark karein.")
             return
 
-        user_data = load_user_data()
-        if user.id not in ADMIN_IDS:
-            user_data[user_id_str]["credits"] -= SEARCH_COST
-            save_user_data(user_data)
+        results = []
+        if isinstance(data, dict):
+            if 'data' in data and isinstance(data['data'], list):
+                results = data['data']
+            elif 'results' in data and isinstance(data['results'], list):
+                results = data['results']
+            elif any(key in data for key in ['mobile', 'name', 'address', 'Mobile', 'Name']):
+                results = [data]
+        elif isinstance(data, list):
+            results = data
 
-        result_text = f"📱 **Search Results for `{phone_number}`**\n\n"
-        for i, info in enumerate(results, 1):
-            result_text += (
-                f"— **Record {i}** —\n"
-                f"👤 Name: {info.get('name','N/A')}\n"
-                f"📞 Mobile: {info.get('mobile','N/A')}\n"
-                f"🏠 Address: {info.get('address','N/A')}\n"
-                f"🌍 Circle: {info.get('circle','N/A')}\n\n"
-            )
+        if results:
+            user_data = load_user_data()
+            is_admin = user.id in ADMIN_IDS
+            if not is_admin:
+                user_data[user_id_str]["credits"] -= SEARCH_COST
+                save_user_data(user_data)
 
-        credits_left = user_data[user_id_str]['credits'] if user.id not in ADMIN_IDS else 'Unlimited'
-        result_text += f"💳 Credits Left: **{credits_left}**"
-        await sent.edit_text(result_text, parse_mode='Markdown')
+            result_text = f"📱 **Indian Mobile Search Results** for `{phone_number}` ({len(results)} found)\n\n"
+
+            for i, info in enumerate(results, 1):
+                mobile_source = info.get('mobile', info.get('Mobile', info.get('phone', 'N/A')))
+                name = info.get('name', info.get('Name', info.get('full_name', info.get('user_name', 'N/A'))))
+                father_spouse_name = info.get('fname', info.get('Father', info.get('FatherName', info.get('father_name', 'N/A'))))
+                address = info.get('address', info.get('Address', info.get('Loc', info.get('location', info.get('full_address', 'N/A')))))
+                alt_mobile = info.get('alt', info.get('AltMobile', info.get('Alt', info.get('alt_mobile', info.get('AlternateMobile', info.get('AltMobileNo', info.get('mobile_2', 'N/A')))))))
+                circle = info.get('circle', info.get('Circle', info.get('Operator', info.get('operator', info.get('Area', info.get('area', 'N/A'))))))
+                aadhaar_id = info.get('id', info.get('Id', info.get('ID', info.get('id_number', info.get('Aadhaar', info.get('aadhaar_id', 'N/A'))))))
+
+                record_text = (f"-- **Record {i}** -- \n"
+                               f"📞 **Mobile/Source**: {mobile_source}\n"
+                               f"👤 **Name**: {name}\n"
+                               f"👨‍👦 **Father's/Spouse's Name**: {father_spouse_name}\n"
+                               f"🏠 **Address**: {address}\n"
+                               f"📞 **Alt Mobile**: {alt_mobile}\n"
+                               f"🌍 **Circle**: {circle}\n"
+                               f"🆔 **ID/Aadhaar**: `{aadhaar_id}`\n\n")
+                result_text += record_text
+
+            credits_left = user_data[user_id_str]['credits'] if not is_admin else "Unlimited"
+            result_text += f"\n💳 Credits Left: **{credits_left}**"
+
+            await sent_message.edit_text(result_text, parse_mode='Markdown')
+        else:
+            await sent_message.edit_text(f"🤷 No details found for mobile number `{phone_number}`.")
 
     except Exception as e:
-        await sent.edit_text("⚠️ Error occurred while searching.")
-        logger.error(f"Phone Lookup Error: {e}")
+        await sent_message.edit_text("⚠️ Error occurred. Contact admin.")
+        logger.error(e)
 
+async def add_credit(update: Update, context: CallbackContext) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
+    try:
+        target_user_id, amount = context.args[0], int(context.args[1])
+        user_data = load_user_data()
+        if str(target_user_id) in user_data:
+            user_data[str(target_user_id)]["credits"] += amount
+            save_user_data(user_data)
+            try:
+                await context.bot.send_message(chat_id=target_user_id, text=f"🎉 An admin has added **{amount} credits** to your account!", parse_mode='Markdown')
+            except Exception:
+                await update.message.reply_text(f"⚠️ Could not notify the user.")
+            await update.message.reply_text(f"✅ Added {amount} credits to user {target_user_id}.")
+        else:
+            await update.message.reply_text("❌ User not found.")
+    except Exception:
+        await update.message.reply_text("⚠️ Usage: `/addcredit <UserID> <Amount>`")
 
-# --- 🚀 RUN BOT ---
-def main() -> None:
+def main():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("addcredit", add_credit))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🚀 Bot is running with Full Admin Credit Management (Add, Deduct, Check)...")
+    print("🚀 Bot is running...")
     application.run_polling()
 
+# --- 🧩 FAKE WEB SERVER for Render (keeps bot alive) ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running successfully!"
 
 if __name__ == '__main__':
-    main()
+    threading.Thread(target=main).start()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
